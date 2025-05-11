@@ -242,3 +242,81 @@ add_action('init', function() {
 
     register_post_type('service', $args);
 });
+add_action('rest_api_init', function(){
+    register_rest_route('site/v1', '/send-request', [
+        'methods'             => 'POST',
+        'callback'            => 'wp_send_request_to_telegram',
+        'permission_callback' => '__return_true',
+        // Для поддержки загрузки файлов:
+        'args' => [
+            'name'    => ['required' => true],
+            'email'   => ['required' => true],
+            'message' => ['required' => true],
+            'file'    => [
+                'required' => false,
+                'type'     => 'file',
+            ],
+        ],
+    ]);
+});
+
+function wp_send_request_to_telegram( \WP_REST_Request $request ) {
+    // Параметры — текстовые поля
+    $name    = sanitize_text_field( $request->get_param('name') );
+    $email   = sanitize_email( $request->get_param('email') );
+    $message = sanitize_textarea_field( $request->get_param('message') );
+
+    // Файл (если передан)
+    $files = $request->get_file_params();
+    $file  = $files['file'] ?? null;
+
+    // Ограничение по размеру 10 МБ
+    if ( $file && $file['size'] > 10 * 1024 * 1024 ) {
+        return new WP_Error(
+            'file_too_large',
+            'Файл занадто великий (максимум 10 МБ).',
+            [ 'status' => 413 ]
+        );
+    }
+
+    // Читаем токен и чат из runtime config (wp-config.php или constants)
+    $botToken = defined('TELEGRAM_BOT_TOKEN') ? TELEGRAM_BOT_TOKEN : get_option('telegram_bot_token');
+    $chatId   = defined('TELEGRAM_CHAT_ID')   ? TELEGRAM_CHAT_ID   : get_option('telegram_chat_id');
+
+    // 1) Отправляем текст
+    $text = wp_slash(
+        "🆕 *Новий запит*  \n" .
+        "*Імʼя:* {$name}  \n" .
+        "*Email:* {$email}  \n" .
+        "*Повідомлення:* {$message}"
+    );
+    wp_remote_post( "https://api.telegram.org/bot{$botToken}/sendMessage", [
+        'headers' => [ 'Content-Type' => 'application/json' ],
+        'body'    => wp_json_encode([
+            'chat_id'    => $chatId,
+            'text'       => $text,
+            'parse_mode' => 'Markdown',
+        ]),
+    ]);
+
+    // 2) Если есть файл — отправляем как документ
+    if ( $file ) {
+        // Используем CurlFile для вложения
+        $cfile = new CURLFile( $file['tmp_name'], $file['type'], $file['name'] );
+        $form  = [
+            'chat_id'  => $chatId,
+            'caption'  => '📎 Доданий файл:',
+            'document' => $cfile,
+        ];
+        // Обход wp_remote_post — прямой curl, чтобы передать файл
+        $ch = curl_init();
+        curl_setopt( $ch, CURLOPT_URL, "https://api.telegram.org/bot{$botToken}/sendDocument" );
+        curl_setopt( $ch, CURLOPT_POST, true );
+        curl_setopt( $ch, CURLOPT_POSTFIELDS, $form );
+        curl_setopt( $ch, CURLOPT_RETURNTRANSFER, true );
+        curl_exec( $ch );
+        curl_close( $ch );
+    }
+
+    return rest_ensure_response([ 'ok' => true ]);
+}
